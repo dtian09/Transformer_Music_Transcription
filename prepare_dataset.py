@@ -9,8 +9,11 @@ with open("co-representation/dictionary.pkl", "rb") as f:
 
 # Inspect keys and content
 emopia_keys = list(emopia_data.keys())
-example_input = emopia_data[emopia_keys[0]]
+print(emopia_keys)
+input0 = emopia_data['x'][0]
+target0 = emopia_data['y'][0]
 token_dict = dictionary
 
-print("example_input: "+str(example_input))
-print(f"token_dict: "+str(token_dict))
+print("input0: "+str(input0))
+print("target0: "+str(target0))
+print("dictionary: "+str(dictionary))
