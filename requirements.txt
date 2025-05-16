@@ -11,3 +11,5 @@ pickle
 fluidsynth
 libfluidsynth-dev
 pyfluidsynth
+pretty_midi
+miditoolkit

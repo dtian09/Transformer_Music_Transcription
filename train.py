@@ -1,4 +1,6 @@
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -7,13 +9,14 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from miditoolkit import MidiFile, Instrument, Note
 from tqdm import tqdm
 import wandb
+import gc
 
 # --- Dataset ---
 class EMOPHIADataset(Dataset):
     def __init__(self, npz_path):
         data = np.load(npz_path, allow_pickle=True)
-        self.inputs = torch.tensor(data['x'], dtype=torch.float32)       # (N, 1024, 64)
-        self.targets = torch.tensor(data['y'], dtype=torch.long)         # (N, 1024, 8, 2)
+        self.inputs = torch.tensor(data['x'], dtype=torch.float32)
+        self.targets = torch.tensor(data['y'], dtype=torch.long)
 
     def __len__(self):
         return len(self.inputs)
@@ -97,17 +100,13 @@ class Audio2MIDINetwork(nn.Module):
         self.conv1d = nn.Conv1d(input_dim, d_model, kernel_size=3, padding=1)
         self.input_proj = nn.Linear(d_model, d_model)
         self.pos_enc_in = PositionalEncoding(max_len, d_model)
-
         self.encoder = nn.ModuleList([
             TransformerEncoderLayer(d_model, n_heads) for _ in range(n_layers)
         ])
-
         self.pos_enc_out = PositionalEncoding(max_len, d_model)
-
         self.decoder = nn.ModuleList([
             TransformerDecoderLayer(d_model, n_heads) for _ in range(n_layers)
         ])
-
         self.output_heads = nn.ModuleList([
             nn.Linear(d_model, vocab_size) for vocab_size in vocab_sizes
         ])
@@ -118,12 +117,13 @@ class Audio2MIDINetwork(nn.Module):
         x = self.pos_enc_in(x)
         for enc in self.encoder:
             x = enc(x)
-
         y_proj = self.pos_enc_out(y_emb)
         for dec in self.decoder:
             y_proj = dec(y_proj, x)
-
-        logits = [head(y_proj) for head in self.output_heads]
+        logits = []
+        for head in self.output_heads:
+            logits.append(head(y_proj))
+            torch.cuda.empty_cache()
         return logits
 
 # --- Load Data ---
@@ -133,27 +133,24 @@ train_len = int(0.6 * len(dataset))
 val_len = int(0.1 * len(dataset))
 test_len = len(dataset) - train_len - val_len
 train_set, val_set, test_set = random_split(dataset, [train_len, val_len, test_len])
-train_loader = DataLoader(train_set, batch_size=16, shuffle=True)
-val_loader = DataLoader(val_set, batch_size=16)
-test_loader = DataLoader(test_set, batch_size=16)
+train_loader = DataLoader(train_set, batch_size=4, shuffle=True)
+val_loader = DataLoader(val_set, batch_size=4)
+test_loader = DataLoader(test_set, batch_size=4)
 
 # --- Vocab Sizes ---
-print("Extracting vocab sizes...")
-all_targets = []
-for _, y in train_loader:
-    all_targets.append(y[:, :, :, 0])
-all_targets = torch.cat(all_targets, dim=0)
+all_targets = torch.cat([y[:, :, :, 0] for _, y in train_loader], dim=0)
 vocab_sizes = [int(all_targets[:, :, i].max().item()) + 1 for i in range(8)]
-print("Vocab sizes:", vocab_sizes)
+del all_targets
 
 # --- Hyperparameters ---
-d_feature = 64
+d_feature = 32 #64
 d_model = 8 * d_feature
+max_len = 512
 
 # --- Model Init ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 embedder = MIDIEmbedder(vocab_sizes, d_feature, d_model).to(device)
-model = Audio2MIDINetwork(64, d_model, 1024, 8, 6, vocab_sizes).to(device)
+model = Audio2MIDINetwork(64, d_model, max_len, 4, 6, vocab_sizes).to(device)
 optimizer = torch.optim.Adam(list(model.parameters()) + list(embedder.parameters()), lr=1e-4)
 criterion = nn.CrossEntropyLoss()
 best_val_loss = float('inf')
@@ -168,28 +165,35 @@ for epoch in range(20):
     model.train()
     embedder.train()
     train_loss = 0
-    for batch_idx, (x, y) in enumerate(tqdm(train_loader)):
+    for x, y in tqdm(train_loader):
         x, y = x.to(device), y.to(device)
+        x = x[:, :512, :]
+        y = y[:, :513, :, :]
         y_input = y[:, :-1, :, 0]
         y_target = y[:, 1:, :, 0]
 
-        emb_path = f"y_input_emb_batch{batch_idx}.pt"
-        if os.path.exists(emb_path):
-            y_input_emb = torch.load(emb_path).to(device)
-        else:
-            y_input_emb = embedder(y_input)
-            torch.save(y_input_emb.cpu(), emb_path)
-
+        y_input_emb = embedder(y_input)
         logits = model(x, y_input_emb)
-        loss = sum(
-            criterion(logits[i].reshape(-1, logits[i].shape[-1]), y_target[:, :, i].reshape(-1))
-            for i in range(8)
-        ) / 8
+
+        loss = 0
+        for i in range(8):
+            out = logits[i]
+            loss += criterion(out.reshape(-1, out.shape[-1]), y_target[:, :, i].reshape(-1))
+            del out
+            torch.cuda.empty_cache()
+        loss /= 8
 
         optimizer.zero_grad()
         loss.backward()
+        
+        del loss
+        gc.collect()
+
         optimizer.step()
         train_loss += loss.item()
+        del logits, y_input_emb, x, y, y_input, y_target
+        torch.cuda.empty_cache()
+        gc.collect()
 
     avg_train_loss = train_loss / len(train_loader)
 
@@ -200,15 +204,23 @@ for epoch in range(20):
     with torch.no_grad():
         for x, y in val_loader:
             x, y = x.to(device), y.to(device)
+            x = x[:, :512, :]
+            y = y[:, :513, :, :]
             y_input = y[:, :-1, :, 0]
             y_target = y[:, 1:, :, 0]
             y_input_emb = embedder(y_input)
             logits = model(x, y_input_emb)
-            loss = sum(
-                criterion(logits[i].reshape(-1, logits[i].shape[-1]), y_target[:, :, i].reshape(-1))
-                for i in range(8)
-            ) / 8
+            loss = 0
+            for i in range(8):
+                out = logits[i]
+                loss += criterion(out.reshape(-1, out.shape[-1]), y_target[:, :, i].reshape(-1))
+                del out
+                torch.cuda.empty_cache()
+            loss /= 8
             val_loss += loss.item()
+            del logits, y_input_emb, x, y, y_input, y_target
+            torch.cuda.empty_cache()
+            gc.collect()
 
     avg_val_loss = val_loss / len(val_loader)
     wandb.log({"train_loss": avg_train_loss, "val_loss": avg_val_loss})
@@ -233,17 +245,22 @@ correct, total = 0, 0
 with torch.no_grad():
     for x, y in tqdm(test_loader):
         x, y = x.to(device), y.to(device)
+        x = x[:, :512, :]
+        y = y[:, :513, :, :]
         y_input = y[:, :-1, :, 0]
         y_target = y[:, 1:, :, 0]
         y_input_emb = embedder(y_input)
         logits = model(x, y_input_emb)
-
         for i in range(8):
             pred = logits[i].argmax(dim=-1)
             target = y_target[:, :, i]
             mask = target != 0
             correct += ((pred == target) * mask).sum().item()
             total += mask.sum().item()
+            del pred
+        del logits, y_input_emb, x, y, y_input, y_target
+        torch.cuda.empty_cache()
+        gc.collect()
 
 accuracy = 100.0 * correct / total
 print(f"Test Accuracy (ignoring padding): {accuracy:.2f}%")
