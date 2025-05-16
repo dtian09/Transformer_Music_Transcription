@@ -76,13 +76,24 @@ class TransformerDecoderLayer(nn.Module):
         tgt = self.norm3(tgt + self.dropout(ff_output))
         return tgt
 
+# --- Embedding Module ---
+class MIDIEmbedder(nn.Module):
+    def __init__(self, vocab_sizes, d_feature, d_model):
+        super().__init__()
+        self.embeds = nn.ModuleList([
+            nn.Embedding(vocab_size, d_feature) for vocab_size in vocab_sizes
+        ])
+        self.proj = nn.Linear(8 * d_feature, d_model)
+
+    def forward(self, y):
+        y_embeds = [embed(y[:, :, i]) for i, embed in enumerate(self.embeds)]
+        concat = torch.cat(y_embeds, dim=-1)
+        return self.proj(concat)
+
 # --- Full Transformer Model ---
 class Audio2MIDINetwork(nn.Module):
-    def __init__(self, input_dim, d_feature, vocab_sizes, max_len, d_model, n_heads, n_layers):
+    def __init__(self, input_dim, d_model, max_len, n_heads, n_layers, vocab_sizes):
         super().__init__()
-        assert len(vocab_sizes) == 8, "Expecting 8 vocab sizes (one for each feature)"
-        assert d_model == 8 * d_feature, "d_model must be 8 × d_feature"
-
         self.conv1d = nn.Conv1d(input_dim, d_model, kernel_size=3, padding=1)
         self.input_proj = nn.Linear(d_model, d_model)
         self.pos_enc_in = PositionalEncoding(max_len, d_model)
@@ -91,10 +102,6 @@ class Audio2MIDINetwork(nn.Module):
             TransformerEncoderLayer(d_model, n_heads) for _ in range(n_layers)
         ])
 
-        self.feature_embeds = nn.ModuleList([
-            nn.Embedding(vocab_size, d_feature) for vocab_size in vocab_sizes
-        ])
-        self.concat_proj = nn.Linear(8 * d_feature, d_model)
         self.pos_enc_out = PositionalEncoding(max_len, d_model)
 
         self.decoder = nn.ModuleList([
@@ -105,47 +112,37 @@ class Audio2MIDINetwork(nn.Module):
             nn.Linear(d_model, vocab_size) for vocab_size in vocab_sizes
         ])
 
-    def forward(self, x, y):
+    def forward(self, x, y_emb):
         x = self.conv1d(x.transpose(1, 2)).transpose(1, 2)
         x = self.input_proj(x)
         x = self.pos_enc_in(x)
         for enc in self.encoder:
             x = enc(x)
 
-        y_embeds = [embed(y[:, :, i]) for i, embed in enumerate(self.feature_embeds)]
-        y_concat = torch.cat(y_embeds, dim=-1)
-        y_proj = self.concat_proj(y_concat)
-        y_proj = self.pos_enc_out(y_proj)
+        y_proj = self.pos_enc_out(y_emb)
         for dec in self.decoder:
             y_proj = dec(y_proj, x)
 
-        logits = [head(y_proj) for head in self.output_heads]  # List of 8 tensors
+        logits = [head(y_proj) for head in self.output_heads]
         return logits
 
-# --- Training Setup ---
+# --- Load Data ---
 data_path = "emopia_data_structured.npz"
 dataset = EMOPHIADataset(data_path)
-
 train_len = int(0.6 * len(dataset))
 val_len = int(0.1 * len(dataset))
 test_len = len(dataset) - train_len - val_len
 train_set, val_set, test_set = random_split(dataset, [train_len, val_len, test_len])
-
 train_loader = DataLoader(train_set, batch_size=16, shuffle=True)
 val_loader = DataLoader(val_set, batch_size=16)
 test_loader = DataLoader(test_set, batch_size=16)
 
-# --- Automatically extract vocab sizes ---
-# Extract vocab sizes from the dataset
+# --- Vocab Sizes ---
 print("Extracting vocab sizes...")
 all_targets = []
-
 for _, y in train_loader:
-    all_targets.append(y[:, :, :, 0])  # shape: (B, T, 8)
-
-all_targets = torch.cat(all_targets, dim=0)  # shape: (N, T, 8)
-
-# Compute vocab size for each feature
+    all_targets.append(y[:, :, :, 0])
+all_targets = torch.cat(all_targets, dim=0)
 vocab_sizes = [int(all_targets[:, :, i].max().item()) + 1 for i in range(8)]
 print("Vocab sizes:", vocab_sizes)
 
@@ -153,40 +150,37 @@ print("Vocab sizes:", vocab_sizes)
 d_feature = 64
 d_model = 8 * d_feature
 
-# --- Model, Optimizer, Loss ---
+# --- Model Init ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = Audio2MIDINetwork(
-    input_dim=64,
-    d_feature=d_feature,
-    vocab_sizes=vocab_sizes,
-    max_len=1024,
-    d_model=d_model,
-    n_heads=8,
-    n_layers=6
-).to(device)
-
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+embedder = MIDIEmbedder(vocab_sizes, d_feature, d_model).to(device)
+model = Audio2MIDINetwork(64, d_model, 1024, 8, 6, vocab_sizes).to(device)
+optimizer = torch.optim.Adam(list(model.parameters()) + list(embedder.parameters()), lr=1e-4)
 criterion = nn.CrossEntropyLoss()
 best_val_loss = float('inf')
 patience = 3
 patience_counter = 0
 
-wandb.init(
-  project="audio2midi-emopia",
-  entity="dtian")
-
+wandb.init(project="audio2midi-emopia", entity="dtian")
 wandb.watch(model)
 
 # --- Training Loop ---
 for epoch in range(20):
     model.train()
+    embedder.train()
     train_loss = 0
-    for x, y in tqdm(train_loader):
+    for batch_idx, (x, y) in enumerate(tqdm(train_loader)):
         x, y = x.to(device), y.to(device)
         y_input = y[:, :-1, :, 0]
         y_target = y[:, 1:, :, 0]
 
-        logits = model(x, y_input)
+        emb_path = f"y_input_emb_batch{batch_idx}.pt"
+        if os.path.exists(emb_path):
+            y_input_emb = torch.load(emb_path).to(device)
+        else:
+            y_input_emb = embedder(y_input)
+            torch.save(y_input_emb.cpu(), emb_path)
+
+        logits = model(x, y_input_emb)
         loss = sum(
             criterion(logits[i].reshape(-1, logits[i].shape[-1]), y_target[:, :, i].reshape(-1))
             for i in range(8)
@@ -201,13 +195,15 @@ for epoch in range(20):
 
     # --- Validation ---
     model.eval()
+    embedder.eval()
     val_loss = 0
     with torch.no_grad():
         for x, y in val_loader:
             x, y = x.to(device), y.to(device)
             y_input = y[:, :-1, :, 0]
             y_target = y[:, 1:, :, 0]
-            logits = model(x, y_input)
+            y_input_emb = embedder(y_input)
+            logits = model(x, y_input_emb)
             loss = sum(
                 criterion(logits[i].reshape(-1, logits[i].shape[-1]), y_target[:, :, i].reshape(-1))
                 for i in range(8)
@@ -229,22 +225,23 @@ for epoch in range(20):
             print("Early stopping.")
             break
 
-# --- Evaluation on Test Set ---
+# --- Evaluation ---
 model.load_state_dict(torch.load("best_model.pt"))
 model.eval()
+embedder.eval()
 correct, total = 0, 0
-
 with torch.no_grad():
     for x, y in tqdm(test_loader):
         x, y = x.to(device), y.to(device)
         y_input = y[:, :-1, :, 0]
-        y_target = y[:, 1:, :, 0]  # (B, T, 8)
-        logits = model(x, y_input)  # List of 8 logits: each (B, T, vocab_i)
+        y_target = y[:, 1:, :, 0]
+        y_input_emb = embedder(y_input)
+        logits = model(x, y_input_emb)
 
         for i in range(8):
-            pred = logits[i].argmax(dim=-1)  # (B, T)
+            pred = logits[i].argmax(dim=-1)
             target = y_target[:, :, i]
-            mask = target != 0  # ignore padding (token 0)
+            mask = target != 0
             correct += ((pred == target) * mask).sum().item()
             total += mask.sum().item()
 
