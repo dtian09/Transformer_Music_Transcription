@@ -8,3 +8,6 @@ tqdm
 matplotlib
 scipy
 pickle
+fluidsynth
+libfluidsynth-dev
+pyfluidsynth
