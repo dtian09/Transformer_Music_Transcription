@@ -1,3 +1,6 @@
+'''
+create emopia_data_structured.npz on disk which contains triples (spectrogram, MIDI tokens input, MIDI tokens targets)
+'''
 import os 
 import zipfile
 import numpy as np
