@@ -143,9 +143,9 @@ vocab_sizes = [int(all_targets[:, :, i].max().item()) + 1 for i in range(8)]
 del all_targets
 
 # --- Hyperparameters ---
-d_feature = 16 #32 #64
+d_feature = 16 #32 64
 d_model = 8 * d_feature
-max_len = 512
+max_len = 200 #512
 
 # --- Model Init ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -167,8 +167,8 @@ for epoch in range(20):
     train_loss = 0
     for x, y in tqdm(train_loader):
         x, y = x.to(device), y.to(device)
-        x = x[:, :512, :]
-        y = y[:, :513, :, :]
+        x = x[:, :max_len, :]
+        y = y[:, :max_len + 1, :, :]
         y_input = y[:, :-1, :, 0]
         y_target = y[:, 1:, :, 0]
 
@@ -185,12 +185,9 @@ for epoch in range(20):
 
         optimizer.zero_grad()
         loss.backward()
-        
-        del loss
-        gc.collect()
-
-        optimizer.step()
         train_loss += loss.item()
+        del loss
+        optimizer.step()
         del logits, y_input_emb, x, y, y_input, y_target
         torch.cuda.empty_cache()
         gc.collect()
@@ -204,8 +201,8 @@ for epoch in range(20):
     with torch.no_grad():
         for x, y in val_loader:
             x, y = x.to(device), y.to(device)
-            x = x[:, :512, :]
-            y = y[:, :513, :, :]
+            x = x[:, :max_len, :]
+            y = y[:, :max_len + 1, :, :]
             y_input = y[:, :-1, :, 0]
             y_target = y[:, 1:, :, 0]
             y_input_emb = embedder(y_input)
@@ -245,8 +242,8 @@ correct, total = 0, 0
 with torch.no_grad():
     for x, y in tqdm(test_loader):
         x, y = x.to(device), y.to(device)
-        x = x[:, :512, :]
-        y = y[:, :513, :, :]
+        x = x[:, :max_len, :]
+        y = y[:, :max_len + 1, :, :]
         y_input = y[:, :-1, :, 0]
         y_target = y[:, 1:, :, 0]
         y_input_emb = embedder(y_input)
