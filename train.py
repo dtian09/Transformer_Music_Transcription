@@ -143,7 +143,7 @@ vocab_sizes = [int(all_targets[:, :, i].max().item()) + 1 for i in range(8)]
 del all_targets
 
 # --- Hyperparameters ---
-d_feature = 32 #64
+d_feature = 16 #32 #64
 d_model = 8 * d_feature
 max_len = 512
 
